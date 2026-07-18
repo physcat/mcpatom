@@ -32,6 +32,12 @@ def srv_tools(s):
 
 def test_initialize():
     s = srv(instructions="Search before you modify.")
+
+    @s.resource("app://doc")
+    def doc() -> str:
+        """Doc."""
+        return ""
+
     for version in mcpatom.PROTOCOL_VERSIONS:
         resp = s.handle_message(request("initialize", {"protocolVersion": version}, id=7))
         assert resp == {
@@ -39,7 +45,7 @@ def test_initialize():
             "id": 7,
             "result": {
                 "protocolVersion": version,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},  # advertised only when one is registered
                 "serverInfo": {"name": "test-server", "version": "0.0.1"},
                 "instructions": "Search before you modify.",
             },
@@ -276,6 +282,33 @@ def test_unserialisable_results_cannot_poison_the_transport():
         assert "error" not in resp
         assert resp["result"]["isError"] is True
         json.dumps(resp)  # the response itself stays serialisable
+
+
+def test_resources():
+    s = srv()
+
+    @s.resource("app://search-syntax", mime_type="text/markdown")
+    def search_syntax() -> str:
+        """Search syntax."""
+        return "# Searching"
+
+    @s.resource("app://logo", mime_type="image/png")
+    def logo() -> bytes:
+        """Logo."""
+        return b"\x89PNG"
+
+    resp = s.handle_message(request("resources/read", {"uri": "app://search-syntax"}))
+    assert resp["result"] == {
+        "contents": [{"uri": "app://search-syntax", "mimeType": "text/markdown", "text": "# Searching"}]
+    }
+
+    # bytes returns become a base64 blob, not text.
+    resp = s.handle_message(request("resources/read", {"uri": "app://logo"}))
+    assert resp["result"] == {"contents": [{"uri": "app://logo", "mimeType": "image/png", "blob": "iVBORw=="}]}
+
+    # Unlike tools/call, read failures are JSON-RPC errors (per spec).
+    resp = s.handle_message(request("resources/read", {"uri": "app://nope"}))
+    assert resp["error"]["code"] == mcpatom.RESOURCE_NOT_FOUND
 
 
 def test_stdio_session_and_recovery():

@@ -22,6 +22,8 @@ METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
+RESOURCE_NOT_FOUND = -32002  # MCP-defined, not JSON-RPC
+
 
 class _JsonRpcError(Exception):
     def __init__(self, code: int, message: str):
@@ -132,6 +134,14 @@ def _name_and_description(fn: Callable, name: str | None, description: str | Non
     return name, description
 
 
+def _register(registry: dict, kind: str, key: str, fn: Callable, entry: dict) -> None:
+    if key in registry:
+        raise ValueError(f"duplicate {kind}: {key}")
+    # a bad input_schema or extra block must fail at registration, using dumps to test it
+    json.dumps(entry, allow_nan=False)  # NaN/Infinity aren't JSON
+    registry[key] = (fn, entry)
+
+
 @dataclass(frozen=True)
 class _Media:
     """Return Image(data, mime_type) or Audio(...) from a tool to emit one
@@ -172,11 +182,15 @@ class Server:
         self.name = name
         self.version = version
         self.instructions = instructions
-        self._tools: dict[str, tuple[Callable, dict]] = {}  # name -> (fn, wire-format listing entry)
+        # each registry maps name/uri -> (fn, wire-format listing entry)
+        self._tools: dict[str, tuple[Callable, dict]] = {}
+        self._resources: dict[str, tuple[Callable, dict]] = {}
         self._handlers = {
             "initialize": self._initialize,
             "tools/list": self._tools_list,
             "tools/call": self._tools_call,
+            "resources/list": self._resources_list,
+            "resources/read": self._resources_read,
             "ping": self._ping,
         }
 
@@ -199,20 +213,37 @@ class Server:
 
         def register(fn: Callable) -> Callable:
             tool_name, desc = _name_and_description(fn, name, description)
-            if tool_name in self._tools:
-                raise ValueError(f"duplicate tool: {tool_name}")
             schema = _input_schema(fn) if input_schema is None else input_schema
             entry = {"name": tool_name, "description": desc, "inputSchema": schema}
             if (out := _output_schema(fn) if output_schema is None else output_schema) is not None:
                 entry["outputSchema"] = out
-            entry |= extra or {}
-            # unserialisable schemas/extra= must fail registration, not every tools/list;
-            # NaN/Infinity aren't JSON, and default dumps would let them through.
-            json.dumps(entry, allow_nan=False)
-            self._tools[tool_name] = (fn, entry)
+            _register(self._tools, "tool", tool_name, fn, entry | (extra or {}))
             return fn
 
         return register(fn) if fn is not None else register
+
+    def resource(
+        self,
+        uri: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        mime_type: str = "text/plain",
+        extra: dict | None = None,
+    ):
+        """Register a function returning str (text) or bytes (base64 blob) as a
+        readable resource, run on every resources/read; optional name=,
+        description= and extra= as in tool()."""
+        if not isinstance(uri, str):  # bare @srv.resource would otherwise silently register nothing
+            raise TypeError("resource() needs a uri string: @srv.resource('scheme://path')")
+
+        def register(fn: Callable) -> Callable:
+            resource_name, desc = _name_and_description(fn, name, description)
+            entry = {"uri": uri, "name": resource_name, "description": desc, "mimeType": mime_type}
+            _register(self._resources, "resource", uri, fn, entry | (extra or {}))
+            return fn
+
+        return register
 
     def handle_message(self, msg: dict) -> dict | None:
         """Assumes well-formed JSON-RPC from a real MCP client; malformed input
@@ -229,6 +260,8 @@ class Server:
                 return _error(id, METHOD_NOT_FOUND, f"method not found: {msg.get('method')}")
 
             return _result(id, handler(msg.get("params") or {}))
+        except _JsonRpcError as e:
+            return _error(id, e.code, str(e))
         except (TypeError, ValueError) as e:
             return _error(id, INVALID_PARAMS, str(e))
         except Exception as e:
@@ -239,7 +272,7 @@ class Server:
         version = params.get("protocolVersion")
         result = {
             "protocolVersion": version if version in PROTOCOL_VERSIONS else _DEFAULT_PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}} | ({"resources": {}} if self._resources else {}),
             "serverInfo": {"name": self.name, "version": self.version},
         }
         if self.instructions is not None:
@@ -248,6 +281,25 @@ class Server:
 
     def _tools_list(self, _params: dict) -> dict:
         return {"tools": [entry for _, entry in self._tools.values()]}
+
+    def _resources_list(self, _params: dict) -> dict:
+        return {"resources": [entry for _, entry in self._resources.values()]}
+
+    def _resources_read(self, params: dict) -> dict:
+        """Unlike tools/call, read failures are JSON-RPC errors (per spec):
+        TypeError/ValueError from the function surface as -32602, others -32603."""
+        uri = params.get("uri")
+        if uri not in self._resources:
+            raise _JsonRpcError(RESOURCE_NOT_FOUND, f"resource not found: {uri}")
+
+        fn, entry = self._resources[uri]
+        result = fn()
+        body = (
+            {"blob": base64.b64encode(result).decode()}
+            if isinstance(result, bytes)
+            else {"text": result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)}
+        )
+        return {"contents": [{"uri": uri, "mimeType": entry["mimeType"], **body}]}
 
     def _tools_call(self, params: dict) -> dict:
         """Any exception past the name lookup is an execution error the model
