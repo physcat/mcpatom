@@ -1,12 +1,24 @@
 """mcpatom: a minimal MCP server in one stdlib-only module."""
 
+import contextlib
+import json
+import sys
+
 PROTOCOL_VERSIONS = frozenset({"2025-06-18", "2025-11-25"})
 _DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 
 # JSON-RPC 2.0 error codes
+PARSE_ERROR = -32700
+INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+
+
+class _JsonRpcError(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 def _result(id, result):
@@ -15,6 +27,16 @@ def _result(id, result):
 
 def _error(id, code, message):
     return {"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}
+
+
+def _parse(raw) -> dict:
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        raise _JsonRpcError(PARSE_ERROR, "parse error") from None
+    if not isinstance(msg, dict):
+        raise _JsonRpcError(INVALID_REQUEST, "message must be a JSON object")
+    return msg
 
 
 class Server:
@@ -61,3 +83,25 @@ class Server:
 
     def _ping(self, _params: dict) -> dict:
         return {}
+
+    def serve_stdio(self, stdin=None, stdout=None):
+        """Serve newline-delimited JSON-RPC until EOF.
+
+        While serving the real stdout, where a stray print() would corrupt
+        the protocol, sys.stdout is redirected to stderr"""
+        stdin, stdout = stdin or sys.stdin, stdout or sys.stdout
+        redirect = contextlib.redirect_stdout(sys.stderr) if stdout is sys.stdout else contextlib.nullcontext()
+        try:
+            with redirect:
+                for line in stdin:
+                    if not line.strip():
+                        continue
+                    try:
+                        response = self.handle_message(_parse(line))
+                    except _JsonRpcError as e:
+                        response = _error(None, e.code, str(e))  # can't get ID when parsing fails.
+                    if response is not None:
+                        stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+                        stdout.flush()
+        except (BrokenPipeError, KeyboardInterrupt):
+            pass

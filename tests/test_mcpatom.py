@@ -1,3 +1,6 @@
+import io
+import json
+
 import mcpatom
 from mcpatom import Server
 
@@ -31,3 +34,24 @@ def test_initialize():
     # An unknown version gets a counter-offer, never a rejection.
     resp = srv().handle_message(request("initialize", {"protocolVersion": "2024-11-05"}))
     assert resp["result"]["protocolVersion"] == "2025-06-18"
+
+
+def test_stdio_session_and_recovery():
+    out = io.StringIO()
+    lines = (
+        '{"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}}\n'
+        '{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'
+        "\n"
+        "{nope\n"
+        "[1, 2]\n"
+        '{"jsonrpc": "2.0", "id": 5, "method": "ping"}\n'
+    )
+    srv().serve_stdio(io.StringIO(lines), out)
+    responses = [json.loads(line) for line in out.getvalue().splitlines()]  # one line per response, by construction
+    # The notification and blank line produce nothing; framing faults answer
+    # with id null (the request's own id is unrecoverable) and serving continues.
+    assert [r.get("id") for r in responses] == [0, None, None, 5]
+    assert responses[0]["result"]["protocolVersion"] == "2025-06-18"
+    assert responses[1]["error"]["code"] == mcpatom.PARSE_ERROR
+    assert responses[2]["error"]["code"] == mcpatom.INVALID_REQUEST
+    assert responses[3]["result"] == {}
