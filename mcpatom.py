@@ -122,6 +122,29 @@ def _output_schema(fn: Callable) -> dict | None:
     return _type_schema(annotation) if is_typeddict(annotation) else None
 
 
+def _prompt_arguments(fn: Callable) -> list[dict]:
+    """Prompt argument values are always strings on the wire, so every parameter
+    must be annotated str; a default makes it optional."""
+    arguments = []
+    hints = get_type_hints(fn, include_extras=True)
+    for name, param in inspect.signature(fn).parameters.items():
+        annotation, description = hints.get(name), None
+        if get_origin(annotation) is Annotated:
+            annotation, *extras = get_args(annotation)
+            description = next((e for e in extras if isinstance(e, str)), None)
+        if annotation is not str:
+            raise TypeError(
+                f"{getattr(fn, '__name__', fn)}: prompt argument '{name}' must be annotated str"
+                " (prompt arguments are strings on the wire)"
+            )
+        arguments.append(
+            {"name": name}
+            | ({"description": description} if description is not None else {})
+            | ({"required": True} if param.default is inspect.Parameter.empty else {})
+        )
+    return arguments
+
+
 def _name_and_description(fn: Callable, name: str | None, description: str | None) -> tuple[str, str]:
     if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
         raise TypeError(f"{getattr(fn, '__name__', fn)}: async def is unsupported; use asyncio.run(...) in a plain def")
@@ -185,12 +208,15 @@ class Server:
         # each registry maps name/uri -> (fn, wire-format listing entry)
         self._tools: dict[str, tuple[Callable, dict]] = {}
         self._resources: dict[str, tuple[Callable, dict]] = {}
+        self._prompts: dict[str, tuple[Callable, dict]] = {}
         self._handlers = {
             "initialize": self._initialize,
             "tools/list": self._tools_list,
             "tools/call": self._tools_call,
             "resources/list": self._resources_list,
             "resources/read": self._resources_read,
+            "prompts/list": self._prompts_list,
+            "prompts/get": self._prompts_get,
             "ping": self._ping,
         }
 
@@ -245,6 +271,31 @@ class Server:
 
         return register
 
+    def prompt(
+        self,
+        fn: Callable | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        extra: dict | None = None,
+    ):
+        """Register a function as a prompt; optional name=, description= and
+        extra= as in tool(). Parameters must be annotated str, and it returns a
+        str for a single user message or a list of message dicts passed through
+        verbatim."""
+        if fn is not None and not callable(fn):
+            raise TypeError(f"prompt() takes no positional name; use @srv.prompt(name='{fn}')")
+
+        def register(fn: Callable) -> Callable:
+            prompt_name, desc = _name_and_description(fn, name, description)
+            entry = {"name": prompt_name, "description": desc}
+            if args := _prompt_arguments(fn):
+                entry["arguments"] = args
+            _register(self._prompts, "prompt", prompt_name, fn, entry | (extra or {}))
+            return fn
+
+        return register(fn) if fn is not None else register
+
     def handle_message(self, msg: dict) -> dict | None:
         """Assumes well-formed JSON-RPC from a real MCP client; malformed input
         gets a best-effort error response rather than field-by-field rejection.
@@ -272,7 +323,9 @@ class Server:
         version = params.get("protocolVersion")
         result = {
             "protocolVersion": version if version in PROTOCOL_VERSIONS else _DEFAULT_PROTOCOL_VERSION,
-            "capabilities": {"tools": {}} | ({"resources": {}} if self._resources else {}),
+            "capabilities": {"tools": {}}
+            | ({"resources": {}} if self._resources else {})
+            | ({"prompts": {}} if self._prompts else {}),
             "serverInfo": {"name": self.name, "version": self.version},
         }
         if self.instructions is not None:
@@ -300,6 +353,27 @@ class Server:
             else {"text": result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)}
         )
         return {"contents": [{"uri": uri, "mimeType": entry["mimeType"], **body}]}
+
+    def _prompts_list(self, _params: dict) -> dict:
+        return {"prompts": [entry for _, entry in self._prompts.values()]}
+
+    def _prompts_get(self, params: dict) -> dict:
+        """As with resources, failures are JSON-RPC errors: unknown name and bad
+        arguments are -32602 (per spec), anything else -32603."""
+        name = params.get("name")
+        if name not in self._prompts:
+            raise ValueError(f"unknown prompt: {name}")
+
+        fn, entry = self._prompts[name]
+        result = fn(**(params.get("arguments") or {}))
+        if isinstance(result, list):  # pre-built message dicts, e.g. few-shot pairs
+            json.dumps(result)  # unserialisable messages must fail here as a JSON-RPC error, not at the transport
+            return {"description": entry["description"], "messages": result}
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        return {
+            "description": entry["description"],
+            "messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+        }
 
     def _tools_call(self, params: dict) -> dict:
         """Any exception past the name lookup is an execution error the model

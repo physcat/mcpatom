@@ -45,7 +45,7 @@ def test_initialize():
             "id": 7,
             "result": {
                 "protocolVersion": version,
-                "capabilities": {"tools": {}, "resources": {}},  # advertised only when one is registered
+                "capabilities": {"tools": {}, "resources": {}},  # prompts absent: none registered
                 "serverInfo": {"name": "test-server", "version": "0.0.1"},
                 "instructions": "Search before you modify.",
             },
@@ -277,11 +277,19 @@ def test_unserialisable_results_cannot_poison_the_transport():
         """Verbatim block smuggling bytes."""
         return ({"type": "text", "text": b"raw"},)
 
+    @s.prompt
+    def bad_messages():
+        """Messages smuggling bytes."""
+        return [{"role": "user", "content": {"type": "text", "text": b"raw"}}]
+
     for name in ("bad_result", "bad_block"):
         resp = s.handle_message(request("tools/call", {"name": name}))
         assert "error" not in resp
         assert resp["result"]["isError"] is True
         json.dumps(resp)  # the response itself stays serialisable
+    resp = s.handle_message(request("prompts/get", {"name": "bad_messages"}))
+    assert resp["error"]["code"] == mcpatom.INVALID_PARAMS
+    json.dumps(resp)
 
 
 def test_resources():
@@ -309,6 +317,48 @@ def test_resources():
     # Unlike tools/call, read failures are JSON-RPC errors (per spec).
     resp = s.handle_message(request("resources/read", {"uri": "app://nope"}))
     assert resp["error"]["code"] == mcpatom.RESOURCE_NOT_FOUND
+
+
+def test_prompts():
+    s = srv()
+
+    @s.prompt
+    def summarise(topic: Annotated[str, "Topic to cover."], length: str = "short") -> str:
+        """Summarise a topic."""
+        return f"Write a {length} summary of {topic}."
+
+    fewshot_messages = [
+        {"role": "user", "content": {"type": "text", "text": "Example in."}},
+        {"role": "assistant", "content": {"type": "text", "text": "Example out."}},
+    ]
+
+    @s.prompt
+    def fewshot():
+        """Few-shot."""
+        return fewshot_messages
+
+    [entry, _] = s.handle_message(request("prompts/list"))["result"]["prompts"]
+    assert entry["arguments"] == [
+        {"name": "topic", "description": "Topic to cover.", "required": True},
+        {"name": "length"},
+    ]
+
+    resp = s.handle_message(request("prompts/get", {"name": "summarise", "arguments": {"topic": "tea"}}))
+    assert resp["result"]["messages"] == [
+        {"role": "user", "content": {"type": "text", "text": "Write a short summary of tea."}}
+    ]
+
+    # A list return is pre-built message dicts, passed through verbatim.
+    resp = s.handle_message(request("prompts/get", {"name": "fewshot"}))
+    assert resp["result"]["messages"] == fewshot_messages
+
+    resp = s.handle_message(request("prompts/get", {"name": "nope"}))
+    assert resp["error"]["code"] == mcpatom.INVALID_PARAMS
+
+    # Prompt argument values are strings on the wire: any other annotation
+    # is a registration error.
+    with pytest.raises(TypeError, match="must be annotated str"):
+        s.prompt(lambda count=3: "x")
 
 
 def test_stdio_session_and_recovery():
