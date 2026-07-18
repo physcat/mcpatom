@@ -7,13 +7,17 @@ import json
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import NoneType, UnionType
 from typing import Annotated, ClassVar, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
+from urllib.parse import urlsplit
 
 PROTOCOL_VERSIONS = frozenset({"2025-06-18", "2025-11-25"})
 _DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 
 _BASIC_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+_LOCALHOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 # JSON-RPC 2.0 error codes
 PARSE_ERROR = -32700
@@ -23,6 +27,15 @@ INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
 RESOURCE_NOT_FOUND = -32002  # MCP-defined, not JSON-RPC
+
+
+def _is_local(url: str) -> bool:
+    """True if the url's hostname is loopback (any port); for a bare Host
+    header value, prefix '//' so urlsplit reads it as a netloc."""
+    try:
+        return urlsplit(url).hostname in _LOCALHOST_NAMES
+    except ValueError:
+        return False
 
 
 class _JsonRpcError(Exception):
@@ -424,3 +437,56 @@ class Server:
                         stdout.flush()
         except (BrokenPipeError, KeyboardInterrupt):
             pass
+
+    def _http_server(self, host: str, port: int) -> ThreadingHTTPServer:
+        handle_message = self.handle_message
+        # MCP-Protocol-Version is ignored: both supported versions behave identically
+        local_only = _is_local("//" + host)  # a wider bind expects remote clients: rebinding checks off
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                pass  # default logs every request to stderr
+
+            def _send(self, status: int, payload: dict | None = None, allow: str | None = None) -> None:
+                body = b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode()
+                self.send_response(status)
+                if body:
+                    self.send_header("Content-Type", "application/json")
+                if allow:
+                    self.send_header("Allow", allow)  # RFC 9110: a 405 must list the allowed methods
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                # a rebound request carries no Origin header, so the Host check is the one that catches it
+                host_header, origin = self.headers.get("Host"), self.headers.get("Origin")
+                host_ok = host_header is not None and _is_local("//" + host_header)
+                origin_ok = origin is None or _is_local(origin)
+                if local_only and not (host_ok and origin_ok):
+                    return self._send(403)
+                if self.path != "/mcp":
+                    return self._send(404)
+
+                try:
+                    msg = _parse(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                except _JsonRpcError as e:
+                    return self._send(400, _error(None, e.code, str(e)))  # can't get ID when parsing fails.
+                response = handle_message(msg)
+                self._send(202) if response is None else self._send(200, response)
+
+            def do_GET(self):
+                self._send(405, allow="POST")  # opening an SSE stream: unsupported, deliberately
+
+        return ThreadingHTTPServer((host, port), Handler)
+
+    def serve_http(self, port: int, *, host: str = "127.0.0.1") -> None:
+        """Serve streamable HTTP at /mcp until interrupted.
+
+        Bound to loopback (the default), non-local Host/Origin get 403; a wider
+        bind switches those checks off. Tools run on per-request threads, so
+        thread-safety is the embedder's problem."""
+        with self._http_server(host, port) as httpd, contextlib.suppress(KeyboardInterrupt):
+            httpd.serve_forever()

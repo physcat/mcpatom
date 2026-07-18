@@ -18,6 +18,15 @@ def greet(name: str, excited: bool = False) -> str:
 srv.serve_stdio()
 ```
 
+For streamable HTTP instead of stdio, end with:
+
+```python
+srv.serve_http(8388)  # http://127.0.0.1:8388/mcp
+```
+
+`serve_http` binds to loopback and rejects DNS-rebinding requests;
+`host="0.0.0.0"` widens the bind and switches those checks off.
+
 ## Wiring it up
 
 ```sh

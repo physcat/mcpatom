@@ -2,6 +2,9 @@ import io
 import json
 import subprocess
 import sys
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Optional, TypedDict
 
@@ -403,3 +406,59 @@ def test_stdio_redirects_print_to_stderr():
     [response] = [json.loads(line) for line in proc.stdout.splitlines()]
     assert response["result"]["content"] == [{"type": "text", "text": "ok"}]
     assert "debug chatter" in proc.stderr
+
+
+def start_http(host="127.0.0.1"):
+    httpd = srv()._http_server(host, 0)
+    # Short poll_interval: shutdown() blocks until serve_forever's poll loop
+    # notices the stop flag, 0.5s per server at the default.
+    threading.Thread(target=lambda: httpd.serve_forever(poll_interval=0.01), daemon=True).start()
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
+
+
+@pytest.fixture
+def http_url():
+    httpd, url = start_http()
+    yield url
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def http_request(url, body=None, headers=None, method=None):
+    req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:  # 4xx/5xx responses arrive as exceptions
+        return e.code, e.read()
+
+
+def test_http_transport(http_url):
+    status, body = http_request(http_url + "/mcp", b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}')
+    assert (status, json.loads(body)) == (200, {"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    status, body = http_request(http_url + "/mcp", b'{"jsonrpc": "2.0", "method": "notifications/initialized"}')
+    assert (status, body) == (202, b"")
+
+    status, body = http_request(http_url + "/mcp", b"{nope")
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == mcpatom.PARSE_ERROR
+
+    assert http_request(http_url + "/mcp", method="GET")[0] == 405  # no SSE stream to open
+    assert http_request(http_url + "/other", b"{}")[0] == 404
+
+
+def test_http_dns_rebinding_checks(http_url):
+    ping = b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}'
+    assert http_request(http_url + "/mcp", ping, {"Host": "evil.example:80"})[0] == 403
+    assert http_request(http_url + "/mcp", ping, {"Origin": "http://evil.example"})[0] == 403
+    # A browser on this machine sends a loopback Origin: allowed.
+    assert http_request(http_url + "/mcp", ping, {"Origin": "http://localhost:3000"})[0] == 200
+
+    # A wider bind means remote clients are expected: checks off.
+    httpd, url = start_http("0.0.0.0")
+    try:
+        assert http_request(url + "/mcp", ping, {"Host": "evil.example"})[0] == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
