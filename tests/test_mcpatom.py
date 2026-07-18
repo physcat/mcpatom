@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Annotated, Literal, Optional, TypedDict
 
 import pytest
 
@@ -47,9 +48,21 @@ def test_initialize():
 
 def test_schema_generation():
     s = srv()
+    marker = object()  # non-str Annotated metadata is someone else's protocol: ignored
 
     @s.tool
-    def echo(a: str, _b: int, _c: float, _d: bool, _e: str = "x") -> str:
+    def echo(
+        a: Annotated[str, "Search query syntax."],
+        _b: Annotated[int, marker],
+        _c: float,
+        _d: bool,
+        _e: list[str],
+        _f: Literal["x", "y"],
+        _g: str | None,
+        _h: list,
+        _i: Optional[Literal["x", "y"]] = None,  # noqa: UP045 (typing.Union origin, deliberately distinct from _g)
+        _j: Annotated[Literal["name", "date"], marker, "Sort order."] | None = None,
+    ) -> str:
         """Echo things back."""
         return a
 
@@ -60,14 +73,38 @@ def test_schema_generation():
         "inputSchema": {
             "type": "object",
             "properties": {
-                "a": {"type": "string"},
+                "a": {"type": "string", "description": "Search query syntax."},
                 "_b": {"type": "integer"},
                 "_c": {"type": "number"},
                 "_d": {"type": "boolean"},
-                "_e": {"type": "string"},
+                "_e": {"type": "array", "items": {"type": "string"}},
+                "_f": {"enum": ["x", "y"]},
+                "_g": {"type": ["string", "null"]},
+                "_h": {"type": "array"},
+                "_i": {"enum": ["x", "y", None]},
+                "_j": {"enum": ["name", "date", None], "description": "Sort order."},
             },
-            "required": ["a", "_b", "_c", "_d"],
+            "required": ["a", "_b", "_c", "_d", "_e", "_f", "_g", "_h"],
         },
+    }
+
+
+def test_typeddict_schemas():
+    s = srv()
+
+    class Query(TypedDict, total=False):
+        tag: str
+
+    @s.tool
+    def report(query: Query) -> str:
+        """Report."""
+        return ""
+
+    [tool] = srv_tools(s)
+    # total=False means no required keys.
+    assert tool["inputSchema"]["properties"]["query"] == {
+        "type": "object",
+        "properties": {"tag": {"type": "string"}},
     }
 
 

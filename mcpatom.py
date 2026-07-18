@@ -5,7 +5,8 @@ import inspect
 import json
 import sys
 from collections.abc import Callable
-from typing import get_type_hints
+from types import NoneType, UnionType
+from typing import Annotated, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
 
 PROTOCOL_VERSIONS = frozenset({"2025-06-18", "2025-11-25"})
 _DEFAULT_PROTOCOL_VERSION = "2025-06-18"
@@ -45,14 +46,49 @@ def _parse(raw) -> dict:
 
 
 def _type_schema(annotation) -> dict:
-    if annotation not in _BASIC_TYPES:  # fail registration rather than publish a wrong schema
-        raise TypeError(f"unsupported annotation: {annotation}")
-    return {"type": _BASIC_TYPES[annotation]}
+    if annotation in _BASIC_TYPES:
+        return {"type": _BASIC_TYPES[annotation]}
+    if annotation is list:
+        return {"type": "array"}
+    if is_typeddict(annotation):
+        hints = get_type_hints(annotation, include_extras=True)
+        schema: dict = {"type": "object", "properties": {k: _type_schema(v) for k, v in hints.items()}}
+        required = [k for k in hints if k in annotation.__required_keys__]
+        if required:
+            schema["required"] = required
+        return schema
+
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        inner, *extras = get_args(annotation)
+        # non-str metadata is someone else's protocol; ignore it, as checkers do.
+        description = next((e for e in extras if isinstance(e, str)), None)
+        return _type_schema(inner) if description is None else {**_type_schema(inner), "description": description}
+    if origin is list:
+        return {"type": "array", "items": _type_schema(get_args(annotation)[0])}
+    if origin is Literal:
+        return {"enum": list(get_args(annotation))}
+    if origin in (Union, UnionType):  # typing.Optional[X] and X | None respectively
+        args = get_args(annotation)
+        if len(args) != 2 or NoneType not in args:
+            raise TypeError(f"unsupported union (only X | None): {annotation}")
+        schema = _type_schema(args[0] if args[1] is NoneType else args[1])
+        if "enum" in schema:
+            schema["enum"] = [*schema["enum"], None]
+        else:
+            schema["type"] = [schema["type"], "null"]
+        return schema
+
+    # fail registration rather than publish a wrong schema
+    raise TypeError(
+        f"unsupported annotation: {annotation}"
+        " (supported: str, int, float, bool, list[X], Literal[...], TypedDict, X | None)"
+    )
 
 
 def _input_schema(fn: Callable) -> dict:
     sig = inspect.signature(fn)
-    hints = get_type_hints(fn)
+    hints = get_type_hints(fn, include_extras=True)
     properties = {}
     required = []
 
