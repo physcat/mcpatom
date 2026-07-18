@@ -8,6 +8,13 @@ from mcpatom import Server
 
 srv = Server("my-server")
 
+
+@srv.tool
+def greet(name: str, excited: bool = False) -> str:
+    """Return a greeting for the given name."""
+    return f"Hello, {name}{'!' if excited else '.'}"
+
+
 srv.serve_stdio()
 ```
 
