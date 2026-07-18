@@ -3,12 +3,16 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Annotated, Literal, Optional, TypedDict
+from typing import TYPE_CHECKING, Annotated, Literal, Optional, TypedDict
 
 import pytest
 
 import mcpatom
 from mcpatom import Server
+
+if TYPE_CHECKING:
+
+    class OnlyAtCheckTime: ...
 
 
 def srv(**kwargs):
@@ -95,10 +99,14 @@ def test_typeddict_schemas():
     class Query(TypedDict, total=False):
         tag: str
 
+    class Report(TypedDict):
+        count: int
+        label: Annotated[str, "Display label."]
+
     @s.tool
-    def report(query: Query) -> str:
+    def report(query: Query) -> Report:
         """Report."""
-        return ""
+        return {"count": 3, "label": "x"}
 
     [tool] = srv_tools(s)
     # total=False means no required keys.
@@ -106,6 +114,34 @@ def test_typeddict_schemas():
         "type": "object",
         "properties": {"tag": {"type": "string"}},
     }
+    # A TypedDict return annotation publishes the matching outputSchema.
+    assert tool["outputSchema"] == {
+        "type": "object",
+        "properties": {"count": {"type": "integer"}, "label": {"type": "string", "description": "Display label."}},
+        "required": ["count", "label"],
+    }
+
+
+def test_explicit_schemas_bypass_generation():
+    s = srv()
+    out = {"type": "object", "properties": {"n": {"type": "integer"}}}
+
+    @s.tool(input_schema={}, output_schema=out)
+    def opaque(**kwargs) -> str:
+        """Takes anything."""
+        return str(kwargs)
+
+    # The bypass must be complete: this annotation cannot evaluate at runtime.
+    @s.tool(input_schema={"type": "object"})
+    def exotic(x: "OnlyAtCheckTime") -> str:
+        """Signature the generator cannot express."""
+        return ""
+
+    tools = {t["name"]: t for t in srv_tools(s)}
+    assert tools["opaque"]["inputSchema"] == {}  # falsy but legal: must not fall back to generation
+    assert tools["opaque"]["outputSchema"] == out
+    assert tools["exotic"]["inputSchema"] == {"type": "object"}
+    assert "outputSchema" not in tools["exotic"]
 
 
 def test_registration_failures():
@@ -133,6 +169,13 @@ def test_registration_failures():
             """Async tools can never work in a sync server."""
             return ""
 
+    with pytest.raises(TypeError):
+
+        @s.tool(extra={"icon": object()})  # would otherwise poison every tools/list response
+        def decorated() -> str:
+            """Decorated."""
+            return ""
+
     @s.tool
     def once() -> str:
         """First."""
@@ -154,11 +197,30 @@ def test_tools_call_result_shapes():
     def quiet() -> None:
         """Returns nothing."""
 
+    @s.tool
+    def hello() -> dict:
+        """Hello."""
+        return {"hello": "こんにちは"}
+
+    @s.tool
+    def items() -> list:
+        """Items."""
+        return ["a", "b"]
+
     resp = s.handle_message(request("tools/call", {"name": "shout", "arguments": {"word": "hi"}}))
     assert resp["result"] == {"content": [{"type": "text", "text": "HI"}]}
 
     resp = s.handle_message(request("tools/call", {"name": "quiet"}))  # arguments omitted: no-arg call
     assert resp["result"] == {"content": []}  # None is no content, not the text "null"
+
+    resp = s.handle_message(request("tools/call", {"name": "hello"}))
+    assert resp["result"] == {
+        "content": [{"type": "text", "text": '{"hello": "こんにちは"}'}],
+        "structuredContent": {"hello": "こんにちは"},
+    }
+
+    resp = s.handle_message(request("tools/call", {"name": "items"}))
+    assert "structuredContent" not in resp["result"]  # must be a JSON object; lists stay text-only
 
     # Recorded decision: any exception from the call, this binding failure
     # included, is isError content, never JSON-RPC -32602.
@@ -171,6 +233,49 @@ def test_tools_call_result_shapes():
     # Only an unknown tool name is a protocol-level fault.
     resp = s.handle_message(request("tools/call", {"name": "nope", "arguments": {}}))
     assert resp["error"]["code"] == mcpatom.INVALID_PARAMS
+
+
+def test_tool_tuple_returns_multiple_blocks():
+    s = srv()
+    link = {"type": "resource_link", "uri": "app://x", "name": "x"}
+
+    @s.tool
+    def screenshot():
+        """Screenshot with caption and a link."""
+        return mcpatom.Image(b"\x89PNG", "image/png"), "viewport 800x600", link, {"n": 1}, {"type": "sedan"}
+
+    resp = s.handle_message(request("tools/call", {"name": "screenshot"}))
+    assert resp["result"] == {
+        "content": [
+            {"type": "image", "data": "iVBORw==", "mimeType": "image/png"},
+            {"type": "text", "text": "viewport 800x600"},
+            link,  # a dict whose "type" names a spec block type passes through verbatim
+            {"type": "text", "text": '{"n": 1}'},  # one without stays data
+            {"type": "text", "text": '{"type": "sedan"}'},  # ambient "type" keys must not enter the block union
+        ]
+    }
+
+
+def test_unserialisable_results_cannot_poison_the_transport():
+    # Unserialisable results must fail inside the handler's isError net,
+    # never at the transport's json.dumps, which would kill a stdio server.
+    s = srv()
+
+    @s.tool
+    def bad_result():
+        """Unserialisable plain result."""
+        return {"when": object()}
+
+    @s.tool
+    def bad_block():
+        """Verbatim block smuggling bytes."""
+        return ({"type": "text", "text": b"raw"},)
+
+    for name in ("bad_result", "bad_block"):
+        resp = s.handle_message(request("tools/call", {"name": name}))
+        assert "error" not in resp
+        assert resp["result"]["isError"] is True
+        json.dumps(resp)  # the response itself stays serialisable
 
 
 def test_stdio_session_and_recovery():

@@ -1,12 +1,14 @@
 """mcpatom: a minimal MCP server in one stdlib-only module."""
 
+import base64
 import contextlib
 import inspect
 import json
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from types import NoneType, UnionType
-from typing import Annotated, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
+from typing import Annotated, ClassVar, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
 
 PROTOCOL_VERSIONS = frozenset({"2025-06-18", "2025-11-25"})
 _DEFAULT_PROTOCOL_VERSION = "2025-06-18"
@@ -82,7 +84,8 @@ def _type_schema(annotation) -> dict:
     # fail registration rather than publish a wrong schema
     raise TypeError(
         f"unsupported annotation: {annotation}"
-        " (supported: str, int, float, bool, list[X], Literal[...], TypedDict, X | None)"
+        " (supported: str, int, float, bool, list[X], Literal[...], TypedDict, X | None;"
+        " a hand-written input_schema= bypasses generation)"
     )
 
 
@@ -108,6 +111,15 @@ def _input_schema(fn: Callable) -> dict:
     return schema
 
 
+def _output_schema(fn: Callable) -> dict | None:
+    try:
+        annotation = get_type_hints(fn, include_extras=True).get("return")
+    except Exception:  # unevaluable annotation (TYPE_CHECKING-only names): no outputSchema, not an error
+        return None
+    # only a TypedDict can describe structuredContent (a JSON object)
+    return _type_schema(annotation) if is_typeddict(annotation) else None
+
+
 def _name_and_description(fn: Callable, name: str | None, description: str | None) -> tuple[str, str]:
     if inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn):
         raise TypeError(f"{getattr(fn, '__name__', fn)}: async def is unsupported; use asyncio.run(...) in a plain def")
@@ -118,6 +130,41 @@ def _name_and_description(fn: Callable, name: str | None, description: str | Non
         # getdoc on a partial or instance returns its class docstring: worse than empty.
         description = (inspect.getdoc(fn) or "") if hasattr(fn, "__name__") else ""
     return name, description
+
+
+@dataclass(frozen=True)
+class _Media:
+    """Return Image(data, mime_type) or Audio(...) from a tool to emit one
+    binary content block; data is raw bytes, base64-encoded on the wire."""
+
+    data: bytes
+    mime_type: str
+
+    _TYPE: ClassVar[str]
+
+    def _block(self) -> dict:
+        return {"type": self._TYPE, "data": base64.b64encode(self.data).decode(), "mimeType": self.mime_type}
+
+
+class Image(_Media):
+    _TYPE = "image"
+
+
+class Audio(_Media):
+    _TYPE = "audio"
+
+
+_BLOCK_TYPES = frozenset({"text", "image", "audio", "resource_link", "resource"})
+
+
+def _content_block(item) -> dict:
+    if isinstance(item, _Media):
+        return item._block()
+    # a dict whose "type" names a spec block type passes through verbatim;
+    # ambient "type" keys in ordinary data must not enter the block union.
+    if isinstance(item, dict) and item.get("type") in _BLOCK_TYPES:
+        return item
+    return {"type": "text", "text": item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)}
 
 
 class Server:
@@ -133,9 +180,20 @@ class Server:
             "ping": self._ping,
         }
 
-    def tool(self, fn: Callable | None = None, *, name: str | None = None, description: str | None = None):
+    def tool(
+        self,
+        fn: Callable | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        input_schema: dict | None = None,
+        output_schema: dict | None = None,
+        extra: dict | None = None,
+    ):
         """Register a function as a tool, using its name, docstring and type
-        annotations; optional name= and description= override."""
+        annotations; optional name= and description= override, and input_schema=
+        and output_schema= bypass generation entirely. extra= merges raw fields
+        (title, annotations, ...) into the tools/list entry verbatim."""
         if fn is not None and not callable(fn):
             raise TypeError(f"tool() takes no positional name; use @srv.tool(name='{fn}')")
 
@@ -143,7 +201,15 @@ class Server:
             tool_name, desc = _name_and_description(fn, name, description)
             if tool_name in self._tools:
                 raise ValueError(f"duplicate tool: {tool_name}")
-            self._tools[tool_name] = (fn, {"name": tool_name, "description": desc, "inputSchema": _input_schema(fn)})
+            schema = _input_schema(fn) if input_schema is None else input_schema
+            entry = {"name": tool_name, "description": desc, "inputSchema": schema}
+            if (out := _output_schema(fn) if output_schema is None else output_schema) is not None:
+                entry["outputSchema"] = out
+            entry |= extra or {}
+            # unserialisable schemas/extra= must fail registration, not every tools/list;
+            # NaN/Infinity aren't JSON, and default dumps would let them through.
+            json.dumps(entry, allow_nan=False)
+            self._tools[tool_name] = (fn, entry)
             return fn
 
         return register(fn) if fn is not None else register
@@ -195,8 +261,16 @@ class Server:
             result = fn(**(params.get("arguments") or {}))
             if result is None:
                 return {"content": []}
-            text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-            return {"content": [{"type": "text", "text": text}]}
+            if isinstance(result, dict):
+                # structuredContent must be a JSON object, so lists/scalars stay text-only.
+                return {
+                    "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                    "structuredContent": result,
+                }
+            items = result if isinstance(result, tuple) else (result,)  # a tuple is several blocks at once
+            content = [_content_block(item) for item in items]
+            json.dumps(content)  # verbatim blocks must fail inside the isError net, not at the transport
+            return {"content": content}
         except Exception as e:
             return {"content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}
 
