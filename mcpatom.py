@@ -119,6 +119,12 @@ def _input_schema(fn: Callable) -> dict:
             raise TypeError(f"{getattr(fn, '__name__', fn)}: parameter '{name}': {e}") from None
         if param.default is inspect.Parameter.empty:
             required.append(name)
+        elif param.default is not None or None in properties[name].get("enum", ()):
+            # a JSON-representable default is published; None stays silent (it reads
+            # as an absent-argument sentinel, indistinguishable from omission)
+            with contextlib.suppress(TypeError, ValueError):
+                # round-trip copies: a mutable default mutated later must not drift the schema
+                properties[name]["default"] = json.loads(json.dumps(param.default, allow_nan=False))
 
     schema: dict = {"type": "object", "properties": properties}
     if required:

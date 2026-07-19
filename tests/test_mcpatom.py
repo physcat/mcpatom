@@ -94,11 +94,28 @@ def test_schema_generation():
                 "_f": {"enum": ["x", "y"]},
                 "_g": {"type": ["string", "null"]},
                 "_h": {"type": "array"},
-                "_i": {"enum": ["x", "y", None]},
-                "_j": {"enum": ["name", "date", None], "description": "Sort order."},
+                "_i": {"enum": ["x", "y", None], "default": None},
+                "_j": {"enum": ["name", "date", None], "description": "Sort order.", "default": None},
             },
             "required": ["a", "_b", "_c", "_d", "_e", "_f", "_g", "_h"],
         },
+    }
+
+
+def test_defaults_publish_in_schemas():
+    s = srv()
+    sentinel: object = object()
+
+    @s.tool
+    def t(_a: int = 8080, _b: str | None = None, _c: list = sentinel) -> str:  # ty: ignore[invalid-parameter-default]
+        """T."""
+        return ""
+
+    [tool] = srv_tools(s)
+    assert tool["inputSchema"]["properties"] == {
+        "_a": {"type": "integer", "default": 8080},
+        "_b": {"type": ["string", "null"]},  # None is an absent-argument sentinel, not a default
+        "_c": {"type": "array"},  # a non-JSON default (a sentinel) cannot enter the schema
     }
 
 

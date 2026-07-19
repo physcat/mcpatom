@@ -73,7 +73,9 @@ Parameters may be annotated with any of these:
 - `TypedDict`
 - `X | None` of any of the above
 
-`Annotated[X, "text"]` adds a description the model sees.
+`Annotated[X, "text"]` adds a description the model sees. A parameter's
+default is published in the schema when it is JSON-representable; a `None`
+default is omitted unless `null` is a selectable `Literal` value.
 
 A tool may return:
 
