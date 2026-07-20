@@ -7,12 +7,29 @@ include = ["mcpatom.py"]
 
 [project]
 name = "mcpatom"
-version = "0.2.0"
+version = "0.2.1"
+description = "A minimal single-file Python MCP Server SDK"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
+authors = [{ name = "Mitch" }]
+keywords = ["mcp", "model-context-protocol", "sdk", "server"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+]
 requires-python = ">=3.10"
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/physcat/mcpatom"
 
 [dependency-groups]
 dev = ["pytest", "ruff", "ty"]
