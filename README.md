@@ -52,8 +52,9 @@ For streamable HTTP instead of stdio, end with:
 srv.serve_http(8388)  # http://127.0.0.1:8388/mcp
 ```
 
-`serve_http` binds to loopback and rejects DNS-rebinding requests;
-`host="0.0.0.0"` widens the bind and switches those checks off.
+`serve_http` accepts only localhost (and the bind host) as Origin/Host;
+`allowed_origins=["*.example.com"]` replaces that list, `["*"]` allows
+any origin, and `host="0.0.0.0"` requires it.
 
 More runnable servers in [examples/](examples/).
 
