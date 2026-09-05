@@ -1,5 +1,7 @@
+import contextlib
 import io
 import json
+import socket
 import subprocess
 import sys
 import threading
@@ -425,20 +427,23 @@ def test_stdio_redirects_print_to_stderr():
     assert "debug chatter" in proc.stderr
 
 
-def start_http(host="127.0.0.1"):
-    httpd = srv()._http_server(host, 0)
+@contextlib.contextmanager
+def serve_http(host="127.0.0.1", allowed_origins=None):
+    httpd = srv()._http_server(host, 0, allowed_origins)
     # Short poll_interval: shutdown() blocks until serve_forever's poll loop
     # notices the stop flag, 0.5s per server at the default.
     threading.Thread(target=lambda: httpd.serve_forever(poll_interval=0.01), daemon=True).start()
-    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 @pytest.fixture
 def http_url():
-    httpd, url = start_http()
-    yield url
-    httpd.shutdown()
-    httpd.server_close()
+    with serve_http() as url:
+        yield url
 
 
 def http_request(url, body=None, headers=None, method=None):
@@ -465,17 +470,51 @@ def test_http_transport(http_url):
     assert http_request(http_url + "/other", b"{}")[0] == 404
 
 
-def test_http_dns_rebinding_checks(http_url):
-    ping = b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}'
-    assert http_request(http_url + "/mcp", ping, {"Host": "evil.example:80"})[0] == 403
-    assert http_request(http_url + "/mcp", ping, {"Origin": "http://evil.example"})[0] == 403
-    # A browser on this machine sends a loopback Origin: allowed.
-    assert http_request(http_url + "/mcp", ping, {"Origin": "http://localhost:3000"})[0] == 200
+PING = b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}'
 
-    # A wider bind means remote clients are expected: checks off.
-    httpd, url = start_http("0.0.0.0")
-    try:
-        assert http_request(url + "/mcp", ping, {"Host": "evil.example"})[0] == 200
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
+
+def test_http_default_is_localhost_only(http_url):
+    assert http_request(http_url + "/mcp", PING, {"Host": "evil.example:80"})[0] == 403
+    assert http_request(http_url + "/mcp", PING, {"Origin": "http://evil.example"})[0] == 403
+    # A browser on this machine sends a loopback Origin: allowed.
+    assert http_request(http_url + "/mcp", PING, {"Origin": "http://localhost:3000"})[0] == 200
+
+    with pytest.raises(ValueError, match="allowed_origins"):
+        srv()._http_server("0.0.0.0", 0)
+    with serve_http("0.0.0.0", allowed_origins=["mcp.example.com"]) as url:
+        assert http_request(url + "/mcp", PING, {"Host": "evil.example"})[0] == 403
+        assert http_request(url + "/mcp", PING, {"Host": "mcp.example.com"})[0] == 200
+    with serve_http(allowed_origins=[]) as url:  # [] denies everything, no fallback to the default
+        assert http_request(url + "/mcp", PING, {"Host": "localhost"})[0] == 403
+
+
+def test_http_rejected_body_is_not_smuggled(http_url):
+    """A rejected request's unread body must not be parsed as a second, self-approving request."""
+    smuggled = b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: %d\r\n\r\n%s" % (len(PING), PING)
+    received = b""
+    with socket.create_connection(("127.0.0.1", int(http_url.rsplit(":", 1)[1])), timeout=2) as sock:
+        sock.sendall(
+            b"POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n"
+            b"Content-Length: %d\r\n\r\n%s" % (len(smuggled), smuggled)
+        )
+        try:
+            while chunk := sock.recv(4096):
+                received += chunk
+        except (TimeoutError, ConnectionResetError):  # a regression leaves the connection open
+            pass
+    assert received.startswith(b"HTTP/1.1 403 Forbidden")
+    assert b"200 OK" not in received
+
+
+def test_http_allowed_origins():
+    with serve_http(allowed_origins=["*.example.com"]) as url:
+        ok = {"Host": "api.example.com"}
+        assert http_request(url + "/mcp", PING, ok | {"Origin": "https://api.example.com"})[0] == 200
+        assert http_request(url + "/mcp", PING, ok | {"Origin": "https://evil.example"})[0] == 403
+        assert http_request(url + "/mcp", PING, {"Host": "api.example.com:8080"})[0] == 200
+        assert http_request(url + "/mcp", PING, {"Host": "evil.example"})[0] == 403
+        # The list replaces the default: localhost is no longer implied.
+        assert http_request(url + "/mcp", PING, {"Host": "localhost"})[0] == 403
+        assert http_request(url + "/mcp", PING, {"Origin": "http://localhost:3000"})[0] == 403
+    with serve_http(allowed_origins=["*"]) as url:
+        assert http_request(url + "/mcp", PING, {"Host": "evil.example", "Origin": "http://elsewhere"})[0] == 200

@@ -5,8 +5,9 @@ import contextlib
 import inspect
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import NoneType, UnionType
 from typing import Annotated, ClassVar, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
@@ -18,6 +19,7 @@ _DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 _BASIC_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
 _LOCALHOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+_WIDE_BINDS = frozenset({"", "0.0.0.0", "::"})
 
 # JSON-RPC 2.0 error codes
 PARSE_ERROR = -32700
@@ -29,13 +31,13 @@ INTERNAL_ERROR = -32603
 RESOURCE_NOT_FOUND = -32002  # MCP-defined, not JSON-RPC
 
 
-def _is_local(url: str) -> bool:
-    """True if the url's hostname is loopback (any port); for a bare Host
-    header value, prefix '//' so urlsplit reads it as a netloc."""
+def _allowed(value: str, patterns: Iterable[str]) -> bool:
+    """Match an Origin or bare Host value: patterns with '://' match the full origin, others the hostname."""
     try:
-        return urlsplit(url).hostname in _LOCALHOST_NAMES
+        hostname = urlsplit(value if "//" in value else "//" + value).hostname or ""
     except ValueError:
         return False
+    return any(fnmatch(value if "://" in p else hostname, p) for p in patterns)
 
 
 class _JsonRpcError(Exception):
@@ -444,10 +446,15 @@ class Server:
         except (BrokenPipeError, KeyboardInterrupt):
             pass
 
-    def _http_server(self, host: str, port: int) -> ThreadingHTTPServer:
+    def _http_server(self, host: str, port: int, allowed_origins: Iterable[str] | None = None) -> ThreadingHTTPServer:
         handle_message = self.handle_message
         # MCP-Protocol-Version is ignored: both supported versions behave identically
-        local_only = _is_local("//" + host)  # a wider bind expects remote clients: rebinding checks off
+        if allowed_origins is None:
+            if host in _WIDE_BINDS:
+                raise ValueError(f"host={host!r} needs allowed_origins")
+            allowed_origins = _LOCALHOST_NAMES | {host}
+        origins = frozenset(allowed_origins)
+        hosts = {(urlsplit(p).hostname or "") if "://" in p else p for p in origins}
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -458,6 +465,9 @@ class Server:
             def _send(self, status: int, payload: dict | None = None, allow: str | None = None) -> None:
                 body = b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode()
                 self.send_response(status)
+                if status >= 400:  # an unread body must not be parsed as the next request
+                    self.close_connection = True
+                    self.send_header("Connection", "close")
                 if body:
                     self.send_header("Content-Type", "application/json")
                 if allow:
@@ -469,9 +479,9 @@ class Server:
             def do_POST(self):
                 # a rebound request carries no Origin header, so the Host check is the one that catches it
                 host_header, origin = self.headers.get("Host"), self.headers.get("Origin")
-                host_ok = host_header is not None and _is_local("//" + host_header)
-                origin_ok = origin is None or _is_local(origin)
-                if local_only and not (host_ok and origin_ok):
+                host_ok = host_header is not None and _allowed(host_header, hosts)
+                origin_ok = origin is None or _allowed(origin, origins)
+                if not (host_ok and origin_ok):
                     return self._send(403)
                 if self.path != "/mcp":
                     return self._send(404)
@@ -488,11 +498,12 @@ class Server:
 
         return ThreadingHTTPServer((host, port), Handler)
 
-    def serve_http(self, port: int, *, host: str = "127.0.0.1") -> None:
+    def serve_http(self, port: int, *, host: str = "127.0.0.1", allowed_origins: Iterable[str] | None = None) -> None:
         """Serve streamable HTTP at /mcp until interrupted.
 
-        Bound to loopback (the default), non-local Host/Origin get 403; a wider
-        bind switches those checks off. Tools run on per-request threads, so
+        Only localhost and the bind host pass as Origin/Host unless allowed_origins
+        replaces that list (fnmatch patterns; '://' matches the full origin). A bind
+        to every interface requires it. Tools run on per-request threads, so
         thread-safety is the embedder's problem."""
-        with self._http_server(host, port) as httpd, contextlib.suppress(KeyboardInterrupt):
+        with self._http_server(host, port, allowed_origins) as httpd, contextlib.suppress(KeyboardInterrupt):
             httpd.serve_forever()
