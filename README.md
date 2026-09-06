@@ -12,7 +12,8 @@ From Greek *atomos*: indivisible. The whole library is a single file,
 ## Scope
 
 - Tools, resources, and prompts, over stdio or streamable HTTP.
-- Protocol versions `2025-06-18` and `2025-11-25`.
+- Protocol versions `2026-07-28` (stateless, per-request `_meta`) and the
+  `initialize`-handshake versions `2025-11-25` and `2025-06-18`, served side by side.
 - stdlib-only Python >= 3.10, no dependencies, ever.
 
 Everything else (sampling, elicitation, subscriptions, auth, etc.) is deliberately omitted.
@@ -113,7 +114,7 @@ or in any `mcpServers` config:
 Smoke test without a client:
 
 ```sh
-echo '{"jsonrpc":"2.0","id":1,"method":"ping"}' | python server.py
-# {"jsonrpc":"2.0","id":1,"result":{}}
+echo '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' | python server.py
+# {"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","_meta":{...},"supportedVersions":[...],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"}}
 ```
 

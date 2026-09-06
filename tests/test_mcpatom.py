@@ -35,6 +35,45 @@ def srv_tools(s):
     return s.handle_message(request("tools/list"))["result"]["tools"]
 
 
+# every result carries these, whichever era the client speaks
+MODERN = {"resultType": "complete", "_meta": {mcpatom._META_SERVER_INFO: {"name": "test-server", "version": "0.0.1"}}}
+CACHEABLE = mcpatom._CACHEABLE
+
+
+def result(resp):
+    """Assert the MODERN fields, then strip them."""
+    assert resp["result"] | MODERN == resp["result"]
+    return {k: v for k, v in resp["result"].items() if k not in MODERN}
+
+
+def test_discover_and_per_request_version():
+    s = srv(instructions="Search before you modify.")
+    resp = s.handle_message(request("server/discover", {"_meta": {mcpatom._META_VERSION: "2026-07-28"}}, id=3))
+    assert resp == {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "result": {
+            **MODERN,
+            "supportedVersions": ("2026-07-28",),
+            "capabilities": {"tools": {}},
+            "instructions": "Search before you modify.",
+            **CACHEABLE,
+        },
+    }
+
+    # A version we don't speak per-request is rejected with the supported list; the client
+    # retries. Legacy versions count: they are only reachable through initialize.
+    for version in "2099-01-01", "2025-11-25":
+        resp = s.handle_message(request("tools/list", {"_meta": {mcpatom._META_VERSION: version}}))
+        assert resp["error"] == {
+            "code": mcpatom.UNSUPPORTED_PROTOCOL_VERSION,
+            "message": "unsupported protocol version",
+            "data": {"supported": ("2026-07-28",), "requested": version},
+        }
+    resp = s.handle_message(request("tools/list", {"_meta": {mcpatom._META_VERSION: "2026-07-28"}}))
+    assert result(resp) == {"tools": [], **CACHEABLE}
+
+
 def test_initialize():
     s = srv(instructions="Search before you modify.")
 
@@ -49,6 +88,7 @@ def test_initialize():
             "jsonrpc": "2.0",
             "id": 7,
             "result": {
+                **MODERN,
                 "protocolVersion": version,
                 "capabilities": {"tools": {}, "resources": {}},  # prompts absent: none registered
                 "serverInfo": {"name": "test-server", "version": "0.0.1"},
@@ -236,13 +276,13 @@ def test_tools_call_result_shapes():
         return ["a", "b"]
 
     resp = s.handle_message(request("tools/call", {"name": "shout", "arguments": {"word": "hi"}}))
-    assert resp["result"] == {"content": [{"type": "text", "text": "HI"}]}
+    assert result(resp) == {"content": [{"type": "text", "text": "HI"}]}
 
     resp = s.handle_message(request("tools/call", {"name": "quiet"}))  # arguments omitted: no-arg call
-    assert resp["result"] == {"content": []}  # None is no content, not the text "null"
+    assert result(resp) == {"content": []}  # None is no content, not the text "null"
 
     resp = s.handle_message(request("tools/call", {"name": "hello"}))
-    assert resp["result"] == {
+    assert result(resp) == {
         "content": [{"type": "text", "text": '{"hello": "こんにちは"}'}],
         "structuredContent": {"hello": "こんにちは"},
     }
@@ -273,7 +313,7 @@ def test_tool_tuple_returns_multiple_blocks():
         return mcpatom.Image(b"\x89PNG", "image/png"), "viewport 800x600", link, {"n": 1}, {"type": "sedan"}
 
     resp = s.handle_message(request("tools/call", {"name": "screenshot"}))
-    assert resp["result"] == {
+    assert result(resp) == {
         "content": [
             {"type": "image", "data": "iVBORw==", "mimeType": "image/png"},
             {"type": "text", "text": "viewport 800x600"},
@@ -328,17 +368,21 @@ def test_resources():
         return b"\x89PNG"
 
     resp = s.handle_message(request("resources/read", {"uri": "app://search-syntax"}))
-    assert resp["result"] == {
-        "contents": [{"uri": "app://search-syntax", "mimeType": "text/markdown", "text": "# Searching"}]
+    assert result(resp) == {
+        "contents": [{"uri": "app://search-syntax", "mimeType": "text/markdown", "text": "# Searching"}],
+        **CACHEABLE,
     }
 
     # bytes returns become a base64 blob, not text.
     resp = s.handle_message(request("resources/read", {"uri": "app://logo"}))
-    assert resp["result"] == {"contents": [{"uri": "app://logo", "mimeType": "image/png", "blob": "iVBORw=="}]}
+    assert result(resp) == {
+        "contents": [{"uri": "app://logo", "mimeType": "image/png", "blob": "iVBORw=="}],
+        **CACHEABLE,
+    }
 
     # Unlike tools/call, read failures are JSON-RPC errors (per spec).
     resp = s.handle_message(request("resources/read", {"uri": "app://nope"}))
-    assert resp["error"]["code"] == mcpatom.RESOURCE_NOT_FOUND
+    assert resp["error"]["code"] == mcpatom.INVALID_PARAMS
 
 
 def test_prompts():
@@ -401,7 +445,7 @@ def test_stdio_session_and_recovery():
     assert responses[0]["result"]["protocolVersion"] == "2025-06-18"
     assert responses[1]["error"]["code"] == mcpatom.PARSE_ERROR
     assert responses[2]["error"]["code"] == mcpatom.INVALID_REQUEST
-    assert responses[3]["result"] == {}
+    assert result(responses[3]) == {}
 
 
 def test_stdio_redirects_print_to_stderr():
@@ -456,8 +500,15 @@ def http_request(url, body=None, headers=None, method=None):
 
 
 def test_http_transport(http_url):
-    status, body = http_request(http_url + "/mcp", b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}')
-    assert (status, json.loads(body)) == (200, {"jsonrpc": "2.0", "id": 1, "result": {}})
+    status, body = http_request(http_url + "/mcp", PING)
+    assert (status, result(json.loads(body))) == (200, {})
+
+    modern = b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {"%s": "2099-01-01"}}}'
+    status, body = http_request(http_url + "/mcp", modern % mcpatom._META_VERSION.encode())
+    assert (status, json.loads(body)["error"]["code"]) == (400, mcpatom.UNSUPPORTED_PROTOCOL_VERSION)
+
+    status, body = http_request(http_url + "/mcp", b'{"jsonrpc": "2.0", "id": 1, "method": "nope"}')
+    assert (status, json.loads(body)["error"]["code"]) == (404, mcpatom.METHOD_NOT_FOUND)
 
     status, body = http_request(http_url + "/mcp", b'{"jsonrpc": "2.0", "method": "notifications/initialized"}')
     assert (status, body) == (202, b"")
