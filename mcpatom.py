@@ -13,8 +13,12 @@ from types import NoneType, UnionType
 from typing import Annotated, ClassVar, Literal, Union, get_args, get_origin, get_type_hints, is_typeddict
 from urllib.parse import urlsplit
 
-PROTOCOL_VERSIONS = frozenset({"2025-06-18", "2025-11-25"})
-_DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+# newest first; 2026-07-28 is stateless (per-request _meta), the rest use an initialize handshake
+PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18")
+_META_VERSION = "io.modelcontextprotocol/protocolVersion"
+_META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
+# ttlMs 0 keeps clients re-fetching as they always did; "private" is the safe scope
+_CACHEABLE = {"ttlMs": 0, "cacheScope": "private"}
 
 _BASIC_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
@@ -28,7 +32,7 @@ METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
-RESOURCE_NOT_FOUND = -32002  # MCP-defined, not JSON-RPC
+UNSUPPORTED_PROTOCOL_VERSION = -32022  # MCP-defined, not JSON-RPC
 
 
 def _allowed(value: str, patterns: Iterable[str]) -> bool:
@@ -46,12 +50,8 @@ class _JsonRpcError(Exception):
         self.code = code
 
 
-def _result(id, result):
-    return {"jsonrpc": "2.0", "id": id, "result": result}
-
-
-def _error(id, code, message):
-    return {"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}
+def _error(id, code, message, **extra):
+    return {"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, **extra}}
 
 
 def _parse(raw) -> dict:
@@ -231,14 +231,16 @@ class Server:
         self._resources: dict[str, tuple[Callable, dict]] = {}
         self._prompts: dict[str, tuple[Callable, dict]] = {}
         self._handlers = {
-            "initialize": self._initialize,
+            "server/discover": self._discover,
+            "initialize": self._initialize,  # legacy handshake; ping likewise
             "tools/list": self._tools_list,
             "tools/call": self._tools_call,
             "resources/list": self._resources_list,
             "resources/read": self._resources_read,
+            "resources/templates/list": lambda _: {"resourceTemplates": []} | _CACHEABLE,
             "prompts/list": self._prompts_list,
             "prompts/get": self._prompts_get,
-            "ping": self._ping,
+            "ping": lambda _: {},
         }
 
     def tool(
@@ -320,7 +322,12 @@ class Server:
     def handle_message(self, msg: dict) -> dict | None:
         """Assumes well-formed JSON-RPC from a real MCP client; malformed input
         gets a best-effort error response rather than field-by-field rejection.
-        A message without an "id" is a notification and never gets a response."""
+        A message without an "id" is a notification and never gets a response.
+
+        Both eras are served: a request with a protocol version in its _meta is
+        stateless (2026-07-28); one without is a legacy client that opened with
+        initialize. Every result carries the modern resultType and serverInfo,
+        which legacy clients ignore."""
 
         id = msg.get("id")
         if id is None:
@@ -331,40 +338,46 @@ class Server:
             if handler is None:
                 return _error(id, METHOD_NOT_FOUND, f"method not found: {msg.get('method')}")
 
-            return _result(id, handler(msg.get("params") or {}))
-        except _JsonRpcError as e:
-            return _error(id, e.code, str(e))
+            params = msg.get("params") or {}
+            version = params.get("_meta", {}).get(_META_VERSION, PROTOCOL_VERSIONS[0])  # legacy: no _meta version
+            if version != PROTOCOL_VERSIONS[0]:
+                data = {"supported": PROTOCOL_VERSIONS[:1], "requested": version}
+                return _error(id, UNSUPPORTED_PROTOCOL_VERSION, "unsupported protocol version", data=data)
+
+            meta = {_META_SERVER_INFO: {"name": self.name, "version": self.version}}
+            return {"jsonrpc": "2.0", "id": id, "result": {"resultType": "complete", "_meta": meta} | handler(params)}
         except (TypeError, ValueError) as e:
             return _error(id, INVALID_PARAMS, str(e))
         except Exception as e:
             return _error(id, INTERNAL_ERROR, str(e))
 
+    def _capabilities(self) -> dict:
+        caps = {"tools": {}, **{k: {} for k, v in (("resources", self._resources), ("prompts", self._prompts)) if v}}
+        return {"capabilities": caps} | ({"instructions": self.instructions} if self.instructions is not None else {})
+
+    def _discover(self, _params: dict) -> dict:
+        return {"supportedVersions": PROTOCOL_VERSIONS[:1]} | self._capabilities() | _CACHEABLE
+
     def _initialize(self, params: dict) -> dict:
-        # Echo the client's version if we support it, else counter-offer
+        # Echo the client's version if we support it, else counter-offer the oldest
         version = params.get("protocolVersion")
-        result = {
-            "protocolVersion": version if version in PROTOCOL_VERSIONS else _DEFAULT_PROTOCOL_VERSION,
-            "capabilities": {"tools": {}}
-            | ({"resources": {}} if self._resources else {})
-            | ({"prompts": {}} if self._prompts else {}),
+        return {
+            "protocolVersion": version if version in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[-1],
             "serverInfo": {"name": self.name, "version": self.version},
-        }
-        if self.instructions is not None:
-            result["instructions"] = self.instructions
-        return result
+        } | self._capabilities()
 
     def _tools_list(self, _params: dict) -> dict:
-        return {"tools": [entry for _, entry in self._tools.values()]}
+        return {"tools": [entry for _, entry in self._tools.values()]} | _CACHEABLE
 
     def _resources_list(self, _params: dict) -> dict:
-        return {"resources": [entry for _, entry in self._resources.values()]}
+        return {"resources": [entry for _, entry in self._resources.values()]} | _CACHEABLE
 
     def _resources_read(self, params: dict) -> dict:
-        """Unlike tools/call, read failures are JSON-RPC errors (per spec):
-        TypeError/ValueError from the function surface as -32602, others -32603."""
+        """Unlike tools/call, read failures are JSON-RPC errors (per spec): an
+        unknown uri and TypeError/ValueError from the function are -32602, others -32603."""
         uri = params.get("uri")
         if uri not in self._resources:
-            raise _JsonRpcError(RESOURCE_NOT_FOUND, f"resource not found: {uri}")
+            raise ValueError(f"resource not found: {uri}")
 
         fn, entry = self._resources[uri]
         result = fn()
@@ -373,10 +386,10 @@ class Server:
             if isinstance(result, bytes)
             else {"text": result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)}
         )
-        return {"contents": [{"uri": uri, "mimeType": entry["mimeType"], **body}]}
+        return {"contents": [{"uri": uri, "mimeType": entry["mimeType"], **body}]} | _CACHEABLE
 
     def _prompts_list(self, _params: dict) -> dict:
-        return {"prompts": [entry for _, entry in self._prompts.values()]}
+        return {"prompts": [entry for _, entry in self._prompts.values()]} | _CACHEABLE
 
     def _prompts_get(self, params: dict) -> dict:
         """As with resources, failures are JSON-RPC errors: unknown name and bad
@@ -421,9 +434,6 @@ class Server:
         except Exception as e:
             return {"content": [{"type": "text", "text": f"{type(e).__name__}: {e}"}], "isError": True}
 
-    def _ping(self, _params: dict) -> dict:
-        return {}
-
     def serve_stdio(self, stdin=None, stdout=None):
         """Serve newline-delimited JSON-RPC until EOF.
 
@@ -448,7 +458,8 @@ class Server:
 
     def _http_server(self, host: str, port: int, allowed_origins: Iterable[str] | None = None) -> ThreadingHTTPServer:
         handle_message = self.handle_message
-        # MCP-Protocol-Version is ignored: both supported versions behave identically
+        # The MCP-Protocol-Version, Mcp-Method and Mcp-Name headers mirror the body and
+        # are not checked against it; the body is the source of truth.
         if allowed_origins is None:
             if host in _WIDE_BINDS:
                 raise ValueError(f"host={host!r} needs allowed_origins")
@@ -491,7 +502,11 @@ class Server:
                 except _JsonRpcError as e:
                     return self._send(400, _error(None, e.code, str(e)))  # can't get ID when parsing fails.
                 response = handle_message(msg)
-                self._send(202) if response is None else self._send(200, response)
+                if response is None:
+                    return self._send(202)
+                # per spec a version rejection is a 400 and an unknown method a 404; other errors travel as 200
+                code = response.get("error", {}).get("code")
+                self._send({UNSUPPORTED_PROTOCOL_VERSION: 400, METHOD_NOT_FOUND: 404}.get(code, 200), response)
 
             def do_GET(self):
                 self._send(405, allow="POST")  # opening an SSE stream: unsupported, deliberately
